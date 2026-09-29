@@ -177,7 +177,7 @@ jobs:
         run: |
           set -e
           mkdir -p artifact
-          find openwrt/bin/targets/sunxi/cortexa7 -type f \
+          find bin/targets/sunxi/cortexa7 -type f \
             \( -name '*.img.gz' -o -name '*.bin' -o -name '*.manifest' -o -name '*.json' -o -name 'sha256sums' \) \
             -exec cp -v {} artifact/ \;
 

@@ -1,0 +1,193 @@
+name: Build Orange Pi Zero XR819 OpenWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      wifi_ssid:
+        description: "Wi-Fi SSID"
+        required: true
+        default: "OrangePi-Zero"
+      wifi_password:
+        description: "Wi-Fi password (8-63 characters)"
+        required: true
+        default: "12345678"
+      rootfs_size:
+        description: "Root filesystem size in MB"
+        required: true
+        default: "512"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Check inputs
+        shell: bash
+        run: |
+          set -e
+          P='${{ inputs.wifi_password }}'
+          if [ "${#P}" -lt 8 ] || [ "${#P}" -gt 63 ]; then
+            echo "Wi-Fi password must be 8-63 characters."
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib \
+            gettext git libncurses5-dev libssl-dev python3-distutils \
+            rsync unzip zlib1g-dev file wget curl patch quilt \
+            swig time xsltproc libelf-dev ecj fastjar \
+            device-tree-compiler
+
+      - name: Download OpenWrt 23.05.2
+        shell: bash
+        run: |
+          set -e
+          curl -L --retry 5 -o openwrt.tar.gz \
+            https://github.com/openwrt/openwrt/archive/refs/tags/v23.05.2.tar.gz
+          tar -xzf openwrt.tar.gz
+          mv openwrt-23.05.2 openwrt
+
+      - name: Apply Orange Pi Zero XR819 patches
+        shell: bash
+        working-directory: openwrt
+        run: |
+          set -e
+
+          curl -L --retry 5 -o All_openwrt-23.05.2.patch \
+            https://raw.githubusercontent.com/melsem/opi-zero-cyberwrt/master/patch/All_openwrt-23.05.2.patch
+
+          curl -L --retry 5 -o 036-.config_openwrt-23.05.2.patch \
+            https://raw.githubusercontent.com/melsem/opi-zero-cyberwrt/master/patch/036-.config_openwrt-23.05.2.patch
+
+          # Match the original author's documented order:
+          # update the standard feeds, apply the source patch, then update/install
+          # the custom opicyberwrt and diskman feeds.
+          ./scripts/feeds update -a
+          patch -p1 < All_openwrt-23.05.2.patch
+
+          ./scripts/feeds update opicyberwrt diskman
+          ./scripts/feeds install -a
+
+          patch -p1 < 036-.config_openwrt-23.05.2.patch
+
+      - name: Force Orange Pi Zero Wi-Fi build options
+        shell: bash
+        working-directory: openwrt
+        run: |
+          set -e
+
+          # The downloaded 036 config is intentionally broad. These lines make
+          # the intended final image explicit and add only the packages needed
+          # for a practical Wi-Fi AP/router.
+          cat >> .config <<'EOF'
+          CONFIG_TARGET_sunxi=y
+          CONFIG_TARGET_sunxi_cortexa7=y
+          CONFIG_TARGET_sunxi_cortexa7_DEVICE_xunlong_orangepi-zero=y
+          CONFIG_TARGET_ROOTFS_EXT4FS=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_TARGET_IMAGES_GZIP=y
+          CONFIG_SUNXI_SD_BOOT_PARTSIZE=20
+          CONFIG_TARGET_ROOTFS_PARTSIZE=512
+
+          CONFIG_PACKAGE_kmod-xradio=y
+          CONFIG_PACKAGE_boot-config=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-mod-admin-full=y
+          CONFIG_PACKAGE_luci-mod-network=y
+          CONFIG_PACKAGE_luci-mod-status=y
+          CONFIG_PACKAGE_luci-mod-system=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_iw=y
+          CONFIG_PACKAGE_wpad-mini=y
+          CONFIG_PACKAGE_dnsmasq=y
+          CONFIG_PACKAGE_dropbear=y
+          EOF
+
+          # Normalize and resolve dependencies.
+          make defconfig
+
+          echo "=== Final target ==="
+          grep -E '^CONFIG_TARGET_(sunxi|sunxi_cortexa7)|^CONFIG_PACKAGE_(kmod-xradio|boot-config|luci|iw|wpad-mini)=' .config || true
+
+      - name: Add first-boot Wi-Fi configuration
+        shell: bash
+        working-directory: openwrt
+        env:
+          WIFI_SSID: ${{ inputs.wifi_ssid }}
+          WIFI_PASSWORD: ${{ inputs.wifi_password }}
+        run: |
+          set -e
+          mkdir -p files/etc/uci-defaults
+
+          cat > files/etc/uci-defaults/99-orangepi-xr819-ap <<EOF
+          #!/bin/sh
+
+          # Orange Pi Zero H2/H2+ XR819 AP defaults.
+          # Ethernet eth0 is the WAN side in the melsem configuration;
+          # Wi-Fi is attached to LAN (192.168.10.1).
+
+          uci -q set wireless.radio0.disabled='0'
+          uci -q set wireless.radio0.channel='1'
+          uci -q set wireless.radio0.htmode='HT20'
+          uci -q set wireless.default_radio0.ssid='${WIFI_SSID}'
+          uci -q set wireless.default_radio0.mode='ap'
+          uci -q set wireless.default_radio0.network='lan'
+          uci -q set wireless.default_radio0.encryption='psk2'
+          uci -q set wireless.default_radio0.key='${WIFI_PASSWORD}'
+          uci -q commit wireless
+
+          # Keep the Orange Pi reachable from the Wi-Fi LAN.
+          uci -q set network.lan.ipaddr='192.168.10.1'
+          uci -q set network.lan.netmask='255.255.255.0'
+          uci -q commit network
+
+          /etc/init.d/network reload 2>/dev/null || true
+          wifi 2>/dev/null || true
+
+          exit 0
+          EOF
+
+          chmod +x files/etc/uci-defaults/99-orangepi-xr819-ap
+
+      - name: Pre-download sources
+        shell: bash
+        working-directory: openwrt
+        run: |
+          set -e
+          make download -j4 V=s
+
+      - name: Build firmware
+        shell: bash
+        working-directory: openwrt
+        run: |
+          set -e
+          make -j2 V=s
+
+      - name: Collect firmware
+        shell: bash
+        run: |
+          set -e
+          mkdir -p artifact
+          find openwrt/bin/targets/sunxi/cortexa7 -type f \
+            \( -name '*.img.gz' -o -name '*.bin' -o -name '*.manifest' -o -name '*.json' -o -name 'sha256sums' \) \
+            -exec cp -v {} artifact/ \;
+
+          echo "=== Firmware files ==="
+          ls -lah artifact
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangepi-zero-xr819-openwrt-23.05.2
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
